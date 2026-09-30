@@ -1,16 +1,8 @@
 #!/usr/bin/env node
 // Read text messages from Phone Link's local database, read-only.
-//
-// Usage: phone-link-texts <command> [options]
-//   contacts NAME [NAME ...]                    Contacts whose name or nickname contains each NAME.
-//   threads [--since DATE] [--with NAME ...]    Conversations newest first, with participants.
-//                                               --with keeps threads that include every NAME.
-//   read THREAD_ID [--since DATE] [--grep RE]   Messages in one conversation, oldest first.
-//   span                                        Dates of the oldest and newest message held.
-//
-// DATE is YYYY-MM-DD in local time. Each run reads a private copy of the database
-// in a temporary folder and deletes it before exiting, including on failure. The
-// live files are only copied, never opened as a database, and nothing is ever
+// Run with --help for the commands. Each run reads a private copy of the
+// database in a temporary folder and deletes it before exiting. The live
+// files are only copied, never opened as a database, and nothing is ever
 // written or sent. Needs Node.js 22.13 or later for the built-in SQLite module.
 
 import { copyFileSync, existsSync, mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
@@ -21,21 +13,44 @@ import { parseArgs } from "node:util";
 const HELP = `phone-link-texts: read the paired phone's texts from Phone Link's local database, read-only.
 
 Commands:
-  contacts NAME [NAME ...]                    Contacts whose name or nickname contains each NAME.
-  threads [--since DATE] [--with NAME ...]    Conversations newest first, with participants.
-                                              --with keeps threads that include every NAME.
-  read THREAD_ID [--since DATE] [--grep RE]   Messages in one conversation, oldest first.
-  span                                        Dates of the oldest and newest message held.
+  contacts NAME [NAME ...]         Contacts whose name or nickname contains each NAME.
+  threads [--with NAME ...]        Conversations newest first, with participants.
+                                   --with keeps threads that include every NAME. A NAME
+                                   with digits also matches the end of a phone number.
+  read THREAD_ID [--grep REGEX]    Messages in one conversation, oldest first.
+  span                             Dates of the oldest and newest message held.
+  query SQL                        Run one SELECT, WITH, or VALUES statement against
+                                   the copy. The contacts database is attached as
+                                   "contacts". Anything that writes is refused.
 
-DATE is YYYY-MM-DD in local time. RE is a case-insensitive regular expression.
+Options:
+  --since DATE      threads, read: on or after this local date (YYYY-MM-DD).
+  --until DATE      threads, read: on or before this local date.
+  --grep REGEX      read: only messages matching this case-insensitive pattern.
+  --json            contacts, threads, read, span: one JSON object per line.
+                    query always prints JSON.
+
 Each run reads a private copy of the database and deletes it before exiting.
-Nothing is ever written or sent.`;
+Nothing is ever written or sent. The schema for query is in the skill's
+references/schema.md.`;
 
 const PACKAGE = join(process.env.LOCALAPPDATA ?? "", "Packages", "Microsoft.YourPhone_8wekyb3d8bbwe");
+const TMP_PREFIX = "phone-texts-";
+// A copy older than this belongs to a run that was killed before it could clean up.
+const STALE_COPY_MS = 60 * 60 * 1000;
 // Windows file times count 100-nanosecond ticks from 1601-01-01 UTC.
 const EPOCH_OFFSET_MS = 11644473600000n;
 const SENT = 2n;
 const UNSENT = new Set([3n, 4n, 5n, 6n]); // Android: 3 draft, 4 outbox, 5 failed, 6 queued
+
+// Which options and how many positionals each command accepts.
+const COMMAND_SHAPE = {
+  contacts: { options: ["json"], positionals: "some" },
+  threads: { options: ["since", "until", "with", "json"], positionals: "none" },
+  read: { options: ["since", "until", "grep", "json"], positionals: "one" },
+  span: { options: ["json"], positionals: "none" },
+  query: { options: [], positionals: "one" },
+};
 
 class Failure extends Error {}
 
@@ -50,9 +65,22 @@ async function loadSqlite() {
   try {
     return (await import("node:sqlite")).DatabaseSync;
   } catch {
-    throw new Failure(`this script needs Node.js 22.13 or later for its built-in SQLite module. This is Node.js ${process.versions.node}.`);
+    throw new Failure(`this script needs Node's built-in SQLite module without a flag: Node.js 22.13 or later in the 22 line, or 23.4 or later. This is Node.js ${process.versions.node}.`);
   } finally {
     process.emitWarning = emit;
+  }
+}
+
+function sweepStaleCopies() {
+  const now = Date.now();
+  for (const entry of readdirSync(tmpdir())) {
+    if (!entry.startsWith(TMP_PREFIX)) continue;
+    const path = join(tmpdir(), entry);
+    try {
+      if (now - statSync(path).mtimeMs > STALE_COPY_MS) rmSync(path, { recursive: true, force: true });
+    } catch {
+      // Another run may be removing it at the same moment.
+    }
   }
 }
 
@@ -89,7 +117,7 @@ function snapshot(DatabaseSync, tmp, opened) {
     contacts = new DatabaseSync(join(tmp, "contacts.db"));
     opened.push(contacts);
   }
-  return { phone, contacts };
+  return { phone, contacts, tmp };
 }
 
 // Timestamps and message types come back as BigInt, because file times exceed JavaScript's safe integer range.
@@ -121,13 +149,25 @@ function toDate(fileTime) {
   return new Date(Number(BigInt(fileTime) / 10000n - EPOCH_OFFSET_MS));
 }
 
-function toFileTime(day) {
+// Local midnight at the start of the named day, plus dayOffset days, as a file time.
+// Stepping by calendar day rather than by 24 hours keeps daylight-saving days whole.
+function toFileTime(flag, day, dayOffset = 0) {
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day ?? "");
-  const local = match && new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
-  if (!local || local.getMonth() !== Number(match[2]) - 1 || local.getDate() !== Number(match[3])) {
-    throw new Failure(`--since must be a date like 2025-01-31, not "${day}"`);
+  const [year, month, date] = match ? match.slice(1).map(Number) : [];
+  const local = match && year >= 1900 ? new Date(year, month - 1, date) : null;
+  if (!local || local.getMonth() !== month - 1 || local.getDate() !== date) {
+    throw new Failure(`--${flag} must be a date like 2025-01-31, not "${day}"`);
   }
-  return (BigInt(local.getTime()) + EPOCH_OFFSET_MS) * 10000n;
+  const start = new Date(year, month - 1, date + dayOffset);
+  return (BigInt(start.getTime()) + EPOCH_OFFSET_MS) * 10000n;
+}
+
+function dateRange(values) {
+  const since = values.since ? toFileTime("since", values.since) : 0n;
+  // --until includes the whole named day: it ends at the next day's local midnight.
+  const until = values.until ? toFileTime("until", values.until, 1) : 2n ** 62n;
+  if (since >= until) throw new Failure("--since must be on or before --until.");
+  return { since, until };
 }
 
 function fmt(date) {
@@ -139,11 +179,19 @@ function fmt(date) {
   return `${day} ${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(hours)}:${pad(date.getMinutes())}${half}`;
 }
 
+// JSON cannot hold BigInt or bytes: small integers become numbers, large ones strings, and a blob its size.
+const jsonSafe = (value) =>
+  JSON.stringify(value, (_, v) => {
+    if (typeof v === "bigint") return v <= BigInt(Number.MAX_SAFE_INTEGER) && v >= -BigInt(Number.MAX_SAFE_INTEGER) ? Number(v) : String(v);
+    if (v instanceof Uint8Array) return `<${v.length} bytes>`;
+    return v;
+  });
+
 function participants(phone, book) {
   const out = new Map();
   for (const { thread_id, normalized_address } of rows(phone, "select thread_id, normalized_address from participant")) {
     const list = out.get(thread_id) ?? [];
-    list.push(book.get(digits(normalized_address)) ?? normalized_address);
+    list.push({ name: book.get(digits(normalized_address)) ?? normalized_address, digits: digits(normalized_address) });
     out.set(thread_id, list);
   }
   return out;
@@ -155,37 +203,40 @@ function sender(type, from, book) {
   return book.get(digits(from)) ?? (from || "unknown");
 }
 
-function cmdContacts({ contacts }, { positionals }) {
+function cmdContacts({ contacts }, { values, positionals }) {
   if (!contacts) throw new Failure("contacts.db is missing, so names cannot be resolved.");
-  if (!positionals.length) throw new Failure("contacts needs at least one NAME.");
   const all = rows(contacts, "select display_name, nickname from contact");
   for (const query of positionals) {
     const q = query.toLowerCase();
     const hits = all
       .filter(({ display_name: dn, nickname: nn }) => (dn ?? "").toLowerCase().includes(q) || (nn ?? "").toLowerCase().includes(q))
       .map(({ display_name: dn, nickname: nn }) => (dn && nn ? `${dn} (${nn})` : dn || nn));
-    console.log(`${query}: ${hits.length ? hits.join(", ") : "no match"}`);
+    if (values.json) console.log(jsonSafe({ query, matches: hits }));
+    else console.log(`${query}: ${hits.length ? hits.join(", ") : "no match"}`);
   }
 }
 
 function cmdThreads({ phone, contacts }, { values }) {
   const book = nameBook(contacts);
   const people = participants(phone, book);
-  const since = values.since ? toFileTime(values.since) : 0n;
-  const wanted = (values.with ?? []).map((w) => w.toLowerCase());
-  const list = rows(phone, "select thread_id, timestamp, msg_count from conversation where timestamp >= ? and msg_count > 0 order by timestamp desc", since);
+  const { since, until } = dateRange(values);
+  const wanted = (values.with ?? []).map((w) => ({ text: w.toLowerCase(), digits: w.replace(/\D/g, "") }));
+  const matches = (w, names) => names.some((n) => String(n.name).toLowerCase().includes(w.text) || (w.digits.length >= 4 && n.digits.endsWith(w.digits.slice(-10))));
+  const list = rows(phone, "select thread_id, timestamp, msg_count from conversation where timestamp >= ? and timestamp < ? and msg_count > 0 order by timestamp desc", since, until);
   for (const { thread_id, timestamp, msg_count } of list) {
     const names = people.get(thread_id) ?? [];
     if (!names.length) continue;
-    if (wanted.length && !wanted.every((w) => names.some((n) => String(n).toLowerCase().includes(w)))) continue;
-    console.log(`${thread_id}\t${fmt(toDate(timestamp))}\t${msg_count} msgs\t${names.length} people\t${[...names].sort().join(", ")}`);
+    if (wanted.length && !wanted.every((w) => matches(w, names))) continue;
+    const sorted = names.map((n) => String(n.name)).sort();
+    if (values.json) console.log(jsonSafe({ thread: thread_id, last: toDate(timestamp)?.toISOString(), messages: msg_count, participants: sorted }));
+    else console.log(`${thread_id}\t${fmt(toDate(timestamp))}\t${msg_count} msgs\t${names.length} people\t${sorted.join(", ")}`);
   }
 }
 
 function cmdRead({ phone, contacts }, { values, positionals }) {
-  if (!/^\d+$/.test(positionals[0] ?? "")) throw new Failure("read needs a THREAD_ID from the threads command.");
+  if (!/^\d+$/.test(positionals[0])) throw new Failure("read needs a THREAD_ID from the threads command.");
   const thread = BigInt(positionals[0]);
-  const since = values.since ? toFileTime(values.since) : 0n;
+  const { since, until } = dateRange(values);
   let pattern = null;
   if (values.grep) {
     try {
@@ -199,29 +250,31 @@ function cmdRead({ phone, contacts }, { values, positionals }) {
   }
   const book = nameBook(contacts);
   const messages = [];
-  for (const m of rows(phone, "select timestamp, from_address, type, body from message where thread_id = ? and timestamp >= ?", thread, since)) {
-    messages.push([m.timestamp, sender(m.type, m.from_address, book), m.body ?? ""]);
+  for (const m of rows(phone, "select timestamp, from_address, type, body from message where thread_id = ? and timestamp >= ? and timestamp < ?", thread, since, until)) {
+    messages.push({ ts: m.timestamp, from: sender(m.type, m.from_address, book), text: m.body ?? "", attachments: [] });
   }
-  for (const m of rows(phone, "select message_id, timestamp, from_address, type from mms where thread_id = ? and timestamp >= ?", thread, since)) {
+  for (const m of rows(phone, "select message_id, timestamp, from_address, type from mms where thread_id = ? and timestamp >= ? and timestamp < ?", thread, since, until)) {
     const parts = rows(phone, "select content_type, text from mms_part where message_id = ?", m.message_id);
-    let text = parts.filter((p) => p.content_type === "text/plain" && p.text).map((p) => p.text).join(" ");
-    const attached = parts.map((p) => p.content_type).filter((ct) => ct !== "text/plain" && ct !== "application/smil");
-    if (attached.length) text += ` [${attached.join(", ")}]`;
-    messages.push([m.timestamp, sender(m.type, m.from_address, book), text.trim() || "[no text]"]);
+    const text = parts.filter((p) => p.content_type === "text/plain" && p.text).map((p) => p.text).join(" ").trim();
+    const attachments = parts.map((p) => p.content_type).filter((ct) => ct !== "text/plain" && ct !== "application/smil");
+    messages.push({ ts: m.timestamp, from: sender(m.type, m.from_address, book), text, attachments });
   }
-  messages.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  messages.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
   let shown = 0;
-  for (const [ts, who, text] of messages) {
-    if (pattern && !pattern.test(text)) continue;
+  for (const m of messages) {
+    const label = [m.text, m.attachments.length ? `[${m.attachments.join(", ")}]` : ""].filter(Boolean).join(" ") || "[no text]";
+    if (pattern && !pattern.test(label)) continue;
     shown += 1;
-    console.log(`${fmt(toDate(ts))} | ${who}: ${text}`);
+    if (values.json) console.log(jsonSafe({ time: toDate(m.ts)?.toISOString(), from: m.from, text: m.text, attachments: m.attachments }));
+    // A line break inside a message becomes an indented continuation, so every message still starts on its own prefixed line.
+    else console.log(`${fmt(toDate(m.ts))} | ${m.from}: ${label.replace(/\r?\n/g, "\n    ")}`);
   }
-  console.log(`${shown} of ${messages.length} messages shown`);
+  if (!values.json) console.log(`${shown} of ${messages.length} messages shown`);
   const rcs = rows(phone, "select count(*) as n from rcs_chat")[0].n;
   if (rcs) console.error(`note: the database holds ${rcs} chat-feature (RCS) messages, which this script does not read.`);
 }
 
-function cmdSpan({ phone }) {
+function cmdSpan({ phone }, { values }) {
   let total = 0n;
   let low = null;
   let high = null;
@@ -233,62 +286,132 @@ function cmdSpan({ phone }) {
       if (high === null || r.hi > high) high = r.hi;
     }
   }
-  if (!total) console.log("no messages held");
+  if (values.json) console.log(jsonSafe({ messages: total, oldest: toDate(low)?.toISOString() ?? null, newest: toDate(high)?.toISOString() ?? null }));
+  else if (!total) console.log("no messages held");
   else console.log(`${total} messages held, from ${fmt(toDate(low))} to ${fmt(toDate(high))}`);
 }
 
-const COMMANDS = { contacts: cmdContacts, threads: cmdThreads, read: cmdRead, span: cmdSpan };
+// The read-only connection refuses ordinary writes, but VACUUM INTO and ATTACH still work on one,
+// and either would put the texts somewhere the cleanup never reaches. So the statement is checked
+// by its text first: exactly one statement, starting with SELECT, WITH, or VALUES, and no keyword
+// that writes, attaches, or changes settings anywhere outside quotes and comments.
+const FORBIDDEN = /\b(insert|update|delete|create|drop|alter|attach|detach|vacuum|reindex|pragma|analyze|begin|commit|rollback|savepoint|release)\b|\breplace\s+into\b/i;
 
-async function main() {
+function checkReadOnly(sql) {
+  let bare = "";
+  for (let i = 0; i < sql.length; i += 1) {
+    const c = sql[i];
+    const close = { "'": "'", '"': '"', "`": "`", "[": "]" }[c];
+    if (close) {
+      const end = sql.indexOf(close, i + 1);
+      if (end < 0) throw new Failure("the query has an unclosed quote.");
+      bare += " ";
+      i = end;
+    } else if (c === "-" && sql[i + 1] === "-") {
+      const end = sql.indexOf("\n", i);
+      bare += " ";
+      i = end < 0 ? sql.length : end;
+    } else if (c === "/" && sql[i + 1] === "*") {
+      const end = sql.indexOf("*/", i + 2);
+      if (end < 0) throw new Failure("the query has an unclosed comment.");
+      bare += " ";
+      i = end + 1;
+    } else {
+      bare += c;
+    }
+  }
+  const body = bare.trim().replace(/;\s*$/, "");
+  if (!body) throw new Failure("query needs one SQL statement.");
+  if (body.includes(";")) throw new Failure("query runs exactly one statement.");
+  if (!/^(select|with|values)\b/i.test(body)) throw new Failure("query runs only a SELECT, WITH, or VALUES statement.");
+  const bad = FORBIDDEN.exec(body);
+  if (bad) throw new Failure(`query refuses "${bad[0].trim()}", because it could write or reach outside the private copy.`);
+}
+
+function cmdQuery({ tmp }, { positionals }, DatabaseSync, opened) {
+  checkReadOnly(positionals[0]);
+  // A separate read-only connection, so a statement that tries to write fails instead of changing the copy.
+  const db = new DatabaseSync(join(tmp, "phone.db"), { readOnly: true });
+  opened.push(db);
+  if (existsSync(join(tmp, "contacts.db"))) db.exec(`attach database '${join(tmp, "contacts.db").replace(/'/g, "''")}' as contacts`);
+  for (const row of rows(db, positionals[0])) console.log(jsonSafe(row));
+}
+
+const COMMANDS = { contacts: cmdContacts, threads: cmdThreads, read: cmdRead, span: cmdSpan, query: cmdQuery };
+
+function parse() {
   let parsed;
   try {
     parsed = parseArgs({
       allowPositionals: true,
       options: {
         since: { type: "string" },
+        until: { type: "string" },
         with: { type: "string", multiple: true },
         grep: { type: "string" },
+        json: { type: "boolean" },
         help: { type: "boolean", short: "h" },
       },
     });
   } catch (err) {
-    throw new Failure(`${err.message}\n\n${HELP}`);
+    throw new Failure(`${err.message}. Run with --help for the commands.`);
   }
   const [command, ...positionals] = parsed.positionals;
-  if (parsed.values.help || !command) {
-    console.log(HELP);
-    return;
-  }
-  const run = COMMANDS[command];
-  if (!run) throw new Failure(`unknown command "${command}".\n\n${HELP}`);
-  // --with takes one NAME per flag (--with A --with B), or several NAMEs after one flag for threads.
   const values = { ...parsed.values };
-  if (command === "threads" && values.with && positionals.length) {
+  if (values.help || !command) return { help: true };
+  const shape = COMMAND_SHAPE[command];
+  if (!shape) throw new Failure(`unknown command "${command}". Run with --help for the commands.`);
+  // --with takes several NAMEs after one flag, so for threads the trailing words belong to it.
+  if (command === "threads" && values.with) {
     values.with = [...values.with, ...positionals];
     positionals.length = 0;
   }
+  const extra = Object.keys(values).filter((key) => !shape.options.includes(key));
+  if (extra.length) throw new Failure(`${command} does not take ${extra.map((k) => `--${k}`).join(", ")}.`);
+  const count = positionals.length;
+  if (shape.positionals === "none" && count) throw new Failure(`${command} takes no arguments, but got "${positionals.join(" ")}".${command === "threads" ? " To filter by people, use --with." : ""}`);
+  if (shape.positionals === "one" && count !== 1) throw new Failure(`${command} takes exactly one argument${command === "query" ? ", the SQL statement in quotes" : ""}.`);
+  if (shape.positionals === "some" && !count) throw new Failure(`${command} needs at least one NAME.`);
+  return { command, values, positionals };
+}
+
+async function main() {
+  const args = parse();
+  if (args.help) {
+    console.log(HELP);
+    return;
+  }
   const DatabaseSync = await loadSqlite();
-  const tmp = mkdtempSync(join(tmpdir(), "phone-texts-"));
+  sweepStaleCopies();
   const opened = [];
+  let tmp = null;
   try {
+    tmp = mkdtempSync(join(tmpdir(), TMP_PREFIX));
     const dbs = snapshot(DatabaseSync, tmp, opened);
-    run(dbs, { values, positionals });
+    COMMANDS[args.command](dbs, args, DatabaseSync, opened);
   } catch (err) {
     if (err instanceof Failure) throw err;
     if (err?.code === "ERR_SQLITE_ERROR") {
+      if (args.command === "query") throw new Failure(`the query failed: ${err.message}`);
       throw new Failure(`the database copy is unreadable or its layout has changed (${err.message}). Retry once, since a copy taken mid-sync can be torn. If it fails again, the schema needs checking.`);
     }
     if (err?.code && /^E[A-Z]+$/.test(err.code)) {
       throw new Failure(`could not copy the database (${err.message}). Phone Link may be mid-sync: try again.`);
     }
-    throw err;
+    throw new Failure(`unexpected ${err?.name ?? "error"}: ${err?.message ?? err}`);
   } finally {
-    for (const db of opened) db.close();
-    rmSync(tmp, { recursive: true, force: true });
+    for (const db of opened) {
+      try {
+        db.close();
+      } catch {
+        // Already closed.
+      }
+    }
+    if (tmp) rmSync(tmp, { recursive: true, force: true });
   }
 }
 
 main().catch((err) => {
-  console.error(err instanceof Failure ? `error: ${err.message}` : err);
+  console.error(`error: ${err instanceof Failure ? err.message : err?.message ?? err}`);
   process.exitCode = 1;
 });

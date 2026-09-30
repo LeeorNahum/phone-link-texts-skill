@@ -4,13 +4,13 @@ An Agent Skill that lets an agent running on a Windows computer read the paired 
 
 ## How it works
 
-Phone Link keeps a synced copy of the phone's recent messages in SQLite files on the computer. The skill's script copies those files to a temporary folder, reads the copy, resolves numbers to contact names, and deletes the copy before it exits. It never opens the live files as a database and never sends anything. The skill also maps the database, so an agent can query a copy directly for anything the script does not cover.
+Phone Link keeps a synced copy of the phone's recent messages in SQLite files on the computer. The skill's script copies those files to a temporary folder, reads the copy, resolves numbers to contact names, and deletes the copy before it exits. It never opens the live files as a database and never sends anything. Beyond its reading commands, it runs any read-only SQL against the same copy, and the skill maps the database for those queries.
 
 ## Files
 
 - `SKILL.md` covers when the skill applies, how to run the script, the privacy rules, and the gotchas.
-- `scripts/phone-texts.mjs` lists contacts, conversations, messages, and the dates held.
-- `references/schema.md` maps the database for direct queries.
+- `scripts/phone-texts.mjs` lists contacts, conversations, messages, and the dates held, and runs read-only queries.
+- `references/schema.md` maps the database for queries.
 - `package.json` exposes the script as a `bin`, so it runs from this repository without being installed.
 - `AGENTS.md` is the maintenance contract for editing this skill.
 

@@ -4,7 +4,7 @@ description: "Use only when the agent is running on the user's own Windows compu
 compatibility: "Windows with Microsoft Phone Link paired to an Android phone. An iPhone pairing syncs no group texts and no messages sent from the phone, so its database holds too little to use. Node.js 22.13 or later, and npm with network access the first time the remote route runs."
 metadata:
   author: "Leeor Nahum"
-  version: "2.0.0"
+  version: "2.1.0"
 ---
 
 # Phone Link Texts
@@ -13,7 +13,7 @@ Phone Link keeps a synced copy of the paired phone's messages in SQLite files on
 
 ## Run The Script
 
-The [bundled script](scripts/phone-texts.mjs) is a shortcut for the common reads. It reads a private copy of the database, resolves phone numbers to contact names, prints local times, and deletes the copy before it exits. For anything it does not cover, query a copy of the database directly using the [schema reference](references/schema.md).
+The [bundled script](scripts/phone-texts.mjs) reads a private copy of the database, resolves phone numbers to contact names, prints local times, and deletes the copy before it exits. Its commands cover the common reads, and `query` runs any read-only SQL statement against the same copy, so nothing in the database is out of reach. The [schema reference](references/schema.md) maps the tables for `query`.
 
 Run it straight from its repository, which works whether or not the skill is on disk, or from the installed skill root:
 
@@ -25,9 +25,12 @@ node <skill-root>/scripts/phone-texts.mjs <command> [options]
 | Command | What it prints |
 | --- | --- |
 | `contacts <name> [<name> ...]` | Saved contacts whose name or nickname contains each name |
-| `threads [--since <YYYY-MM-DD>] [--with <name> ...]` | Conversations newest first, with their participants |
-| `read <thread-id> [--since <YYYY-MM-DD>] [--grep <regex>]` | One conversation's messages, oldest first |
+| `threads [--since <date>] [--until <date>] [--with <name> ...]` | Conversations newest first, with their participants. A name with digits also matches the end of a phone number |
+| `read <thread-id> [--since <date>] [--until <date>] [--grep <regex>]` | One conversation's messages, oldest first |
 | `span` | The dates of the oldest and newest message held |
+| `query "<sql>"` | Rows of one `SELECT`, `WITH`, or `VALUES` statement as JSON, with the contacts database attached as `contacts`. Anything that could write is refused |
+
+Dates are `YYYY-MM-DD` in local time, and `--until` includes the whole day. Add `--json` to any other command for one JSON object per line. A command rejects an option it does not use rather than ignoring it.
 
 1. Resolve the people the task names with `contacts`. A saved name often differs from the name people use elsewhere: a nickname, a shortened first name, or a context tag in place of the surname. Confirm a partial match against the other people in the conversation before trusting it.
 2. Find the conversation with `threads --with`, which keeps only threads that include every name given. A group text is the thread whose participants are exactly the group.
