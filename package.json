@@ -1,0 +1,15 @@
+{
+  "name": "phone-link-texts",
+  "version": "2.0.0",
+  "description": "Reads the paired phone's text messages from Microsoft Phone Link's local database on Windows, read-only.",
+  "type": "module",
+  "bin": {
+    "phone-link-texts": "scripts/phone-texts.mjs"
+  },
+  "files": [
+    "scripts/phone-texts.mjs"
+  ],
+  "engines": {
+    "node": ">=22.13"
+  }
+}
