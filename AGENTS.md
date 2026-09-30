@@ -22,6 +22,9 @@ Rules for editing the **phone-link-texts** skill. User-facing guidance lives in 
 - `--until` ends at the next day's local midnight, stepped by calendar day, so a daylight-saving day stays whole.
 - The script has no dependencies. It uses Node's built-in `node:sqlite` and `node:util` `parseArgs`, which is why it needs Node.js 22.13 or later. It silences only the SQLite experimental-feature warning.
 - Timestamps and message types are read as BigInt, because Windows file times exceed JavaScript's safe integer range.
+- The databases live under `%LOCALAPPDATA%\Packages\Microsoft.YourPhone_8wekyb3d8bbwe\LocalCache\Indexed\<device>\System\Database\`, one folder per pairing, and a re-paired phone can leave an old folder behind. The package suffix is Microsoft's publisher id, the same on every computer. `phone.db` holds messages and `contacts.db` names.
+- Both databases run in WAL mode, so the newest rows sit in the `-wal` file and `phone.db` itself can lag by hours. The script copies each `-wal` with its database and picks the newest phone by the `-wal` modification time. The `-shm` file is a rebuildable cache and is not copied.
+- The script does not read the RCS tables and only warns when `rcs_chat` has rows.
 
 ## Editing
 

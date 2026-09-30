@@ -4,7 +4,7 @@ description: "Use only when the agent is running on the user's own Windows compu
 compatibility: "Windows with Microsoft Phone Link paired to an Android phone. An iPhone pairing syncs no group texts and no messages sent from the phone, so its database holds too little to use. Node.js 22.13 or later, and npm with network access the first time the remote route runs."
 metadata:
   author: "Leeor Nahum"
-  version: "2.1.0"
+  version: "2.1.1"
 ---
 
 # Phone Link Texts
